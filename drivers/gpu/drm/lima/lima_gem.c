@@ -16,6 +16,8 @@ struct lima_bo {
 	struct drm_gem_object gem;
 	dma_addr_t dma_addr;
 	void *cpu_addr;
+	unsigned long dma_attrs;
+	struct sg_table *sgt;
 
 	struct mutex lock;
 	struct list_head va;
@@ -73,10 +75,33 @@ int lima_gem_create_handle(struct drm_device *dev, struct drm_file *file,
 	if (IS_ERR(bo))
 		return PTR_ERR(bo);
 
-	bo->cpu_addr = dma_alloc_coherent(dev->dev, size, &bo->dma_addr, GFP_USER);
-	if (!bo->cpu_addr) {
+	bo->sgt = kzalloc(sizeof(struct sg_table), GFP_KERNEL);
+	if (!bo->sgt) {
 		err = -ENOMEM;
 		goto err_out;
+	}
+
+	bo->dma_attrs = 0;
+
+	if (flags & LIMA_GEM_FLAG_CONTIG) {
+		/* allocate contiguous buffer e.g. for display hardware without an IOMMU */
+		bo->dma_attrs |= DMA_ATTR_FORCE_CONTIGUOUS;
+	}
+
+	bo->cpu_addr = dma_alloc_attrs(dev->dev, size, &bo->dma_addr, GFP_USER,
+			bo->dma_attrs);
+	if (!bo->cpu_addr) {
+		err = -ENOMEM;
+		goto err_dma_alloc;
+	}
+
+	dev_info(dev->dev, "allocated bo with dma_addr %pad\n", &bo->dma_addr);
+
+	err = dma_get_sgtable_attrs(dev->dev, bo->sgt, bo->cpu_addr,
+			bo->dma_addr, size, bo->dma_attrs);
+	if (err < 0) {
+		DRM_ERROR("Failed to get sgtable.\n");
+		goto err_dma_alloc;
 	}
 
 	bo->resv = &bo->_resv;
@@ -87,7 +112,9 @@ int lima_gem_create_handle(struct drm_device *dev, struct drm_file *file,
 	drm_gem_object_unreference_unlocked(&bo->gem);
 
 	return err;
-
+err_dma_alloc:
+	kfree(bo->sgt);
+	bo->sgt = NULL;
 err_out:
 	lima_gem_free_object(&bo->gem);
 	return err;
@@ -104,8 +131,13 @@ void lima_gem_free_object(struct drm_gem_object *obj)
 		kfree(bo_va);
 	}
 
-	if (!obj->import_attach)
-		dma_free_coherent(obj->dev->dev, obj->size, bo->cpu_addr, bo->dma_addr);
+	if (bo->sgt) {
+		sg_free_table(bo->sgt);
+		kfree(bo->sgt);
+	}
+
+	if (!obj->import_attach && bo->cpu_addr)
+		dma_free_attrs(obj->dev->dev, obj->size, bo->cpu_addr, bo->dma_addr, bo->dma_attrs);
 
 	reservation_object_fini(&bo->_resv);
 	drm_gem_object_release(obj);
@@ -141,8 +173,8 @@ int lima_gem_mmap(struct file *filp, struct vm_area_struct *vma)
 	vma->vm_pgoff = 0;
 
 	bo = to_lima_bo(vma->vm_private_data);
-	err = dma_mmap_coherent(bo->gem.dev->dev, vma, bo->cpu_addr,
-				bo->dma_addr, bo->gem.size);
+	err = dma_mmap_attrs(bo->gem.dev->dev, vma, bo->cpu_addr,
+				bo->dma_addr, bo->gem.size, bo->dma_attrs);
 	if (err) {
 		drm_gem_vm_close(vma);
 		return err;
@@ -189,7 +221,7 @@ int lima_gem_va_map(struct drm_file *file, u32 handle, u32 flags, u32 va)
 		goto err_out0;
 	}
 
-	err = lima_vm_map(priv->vm, bo->dma_addr, va, obj->size);
+	err = lima_vm_map(priv->vm, bo->sgt, va, obj->size);
 	if (err)
 		goto err_out0;
 
@@ -448,6 +480,7 @@ struct drm_gem_object *lima_gem_prime_import_sg_table(struct drm_device *dev,
 
 	bo->cpu_addr = sg_virt(sgt->sgl);
 	bo->dma_addr = sg_dma_address(sgt->sgl);
+	bo->sgt = sgt;
 	bo->resv = attach->dmabuf->resv;
 
 	return &bo->gem;
@@ -456,21 +489,6 @@ struct drm_gem_object *lima_gem_prime_import_sg_table(struct drm_device *dev,
 struct sg_table *lima_gem_prime_get_sg_table(struct drm_gem_object *obj)
 {
 	struct lima_bo *bo = to_lima_bo(obj);
-	struct sg_table *sgt;
-	int ret;
 
-	sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
-	if (!sgt)
-		return NULL;
-
-	ret = dma_get_sgtable(obj->dev->dev, sgt, bo->cpu_addr,
-			      bo->dma_addr, obj->size);
-	if (ret < 0)
-		goto out;
-
-	return sgt;
-
-out:
-	kfree(sgt);
-	return NULL;
+	return bo->sgt;
 }

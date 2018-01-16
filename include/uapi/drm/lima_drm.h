@@ -36,6 +36,8 @@ struct drm_lima_info {
 	__u32 num_pp;  /* out */
 };
 
+#define LIMA_GEM_FLAG_CONTIG (1 << 0) /* gem buffer must be contiguous */
+
 struct drm_lima_gem_create {
 	__u32 size;    /* in */
 	__u32 flags;   /* in */

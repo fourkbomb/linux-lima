@@ -64,7 +64,7 @@ static inline void lima_vm_put(struct lima_vm *vm)
 	kref_put(&vm->refcount, lima_vm_release);
 }
 
-int lima_vm_map(struct lima_vm *vm, dma_addr_t dma, u32 va, u32 size);
+int lima_vm_map(struct lima_vm *vm, struct sg_table *sgt, u32 va, u32 size);
 int lima_vm_unmap(struct lima_vm *vm, u32 va, u32 size);
 
 void lima_vm_print(struct lima_vm *vm);

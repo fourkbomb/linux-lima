@@ -55,13 +55,75 @@ static void lima_vm_unmap_page_table(struct lima_vm *vm, u32 start, u32 end)
 	}
 }
 
-int lima_vm_map(struct lima_vm *vm, dma_addr_t dma, u32 va, u32 size)
+static int lima_vm_map_page(struct lima_vm *vm, phys_addr_t addr, u32 va)
+{
+	u32 pde = LIMA_PDE(va);
+	u32 pte = LIMA_PTE(va);
+
+	/* initialise the page directory if it isn't already initialised */
+	if (!vm->pts[pde].cpu) {
+		vm->pts[pde].cpu = dma_alloc_coherent(
+				vm->dev->dev, LIMA_PAGE_SIZE,
+				&vm->pts[pde].dma, GFP_KERNEL);
+		if (!vm->pts[pde].cpu)
+			return -ENOMEM;
+
+		memset(vm->pts[pde].cpu, 0, LIMA_PAGE_SIZE);
+		vm->pd.cpu[pde] = vm->pts[pde].dma | LIMA_VM_FLAG_PRESENT;
+		vm->pd.dma++;
+	}
+
+	/* dma address should be 4K aligned, so use the lower 12 bit
+	 * as a reference count, 12bit is enough for 1024 max count
+	 */
+	vm->pts[pde].dma++;
+	vm->pts[pde].cpu[pte] = addr | LIMA_VM_FLAGS_CACHE;
+
+	return 0;
+}
+
+static int lima_vm_map_sgtable(struct lima_vm *vm, struct sg_table *sgt, u32 va)
+{
+	int err;
+	unsigned count;
+	struct scatterlist *sg;
+	u32 len;
+	u32 start = va;
+	phys_addr_t addr;
+
+	pr_info("%s mapping sgtable 0x%p nents=%u\n", __func__, sgt, sgt->nents);
+
+	for_each_sg(sgt->sgl, sg, sgt->nents, count) {
+		addr = sg_phys(sg);
+		len = sg->length;
+		pr_info("%s: scatterlist @ 0x%x, length 0x%x, for va 0x%x\n", __func__, addr, len, va);
+
+		while (len > 0) {
+			err = lima_vm_map_page(vm, addr, va);
+			if (err < 0) {
+				goto err_out;
+			}
+
+			addr += LIMA_PAGE_SIZE;
+			va += LIMA_PAGE_SIZE;
+			len -= LIMA_PAGE_SIZE;
+		}
+	}
+
+	return 0;
+err_out:
+	lima_vm_unmap_page_table(vm, start, va);
+	return err;
+}
+
+int lima_vm_map(struct lima_vm *vm, struct sg_table *sgt, u32 va, u32 size)
 {
 	int err;
 	struct interval_tree_node *it;
-	u32 addr;
 
 	mutex_lock(&vm->lock);
+
+	dev_info(vm->dev->dev, "mapping bo @ 0x%x - 0x%x\n", va, va+size);
 
 	it = interval_tree_iter_first(&vm->va, va, va + size - 1);
 	if (it) {
@@ -81,35 +143,14 @@ int lima_vm_map(struct lima_vm *vm, dma_addr_t dma, u32 va, u32 size)
 	it->last = va + size - 1;
 	interval_tree_insert(it, &vm->va);
 
-	for (addr = va; addr < va + size; addr += LIMA_PAGE_SIZE, dma += LIMA_PAGE_SIZE) {
-		u32 pde = LIMA_PDE(addr);
-		u32 pte = LIMA_PTE(addr);
-
-		if (!vm->pts[pde].cpu) {
-			vm->pts[pde].cpu = dma_alloc_coherent(
-				vm->dev->dev, LIMA_PAGE_SIZE,
-				&vm->pts[pde].dma, GFP_KERNEL);
-			if (!vm->pts[pde].cpu) {
-				err = -ENOMEM;
-				goto err_out1;
-			}
-			memset(vm->pts[pde].cpu, 0, LIMA_PAGE_SIZE);
-			vm->pd.cpu[pde] = vm->pts[pde].dma | LIMA_VM_FLAG_PRESENT;
-			vm->pd.dma++;
-		}
-
-		/* dma address should be 4K aligned, so use the lower 12 bit
-		 * as a reference count, 12bit is enough for 1024 max count
-		 */
-		vm->pts[pde].dma++;
-		vm->pts[pde].cpu[pte] = dma | LIMA_VM_FLAGS_CACHE;
-	}
+	err = lima_vm_map_sgtable(vm, sgt, va);
+	if (err)
+		goto err_out1;
 
 	mutex_unlock(&vm->lock);
 	return 0;
 
 err_out1:
-	lima_vm_unmap_page_table(vm, va, addr);
 	interval_tree_remove(it, &vm->va);
 	kfree(it);
 err_out0:
@@ -139,6 +180,7 @@ int lima_vm_unmap(struct lima_vm *vm, u32 va, u32 size)
 	else
 		goto err_out;
 
+	dev_info(vm->dev->dev, "unmapping bo @ 0x%x - 0x%x\n", va, va+size);
 	lima_vm_unmap_page_table(vm, va, va + size);
 
 	mutex_unlock(&vm->lock);
